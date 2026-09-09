@@ -167,22 +167,59 @@
     background-color: #000000;
     cursor: default;
   }
+  .canvas-column {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+  }
+  #top-pane {
+    background-color: #171717;
+    border-bottom: 1px solid #333333;
+    padding: 8px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    z-index: 6;
+    max-height: 40%;
+    overflow-y: auto;
+  }
   #error-banner {
-    position: absolute;
-    top: 16px;
-    left: 50%;
-    transform: translateX(-50%);
     background-color: #dc3545;
     color: white;
-    padding: 10px 20px;
+    padding: 8px 14px;
     border-radius: 6px;
     font-weight: 600;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-    z-index: 20;
-    display: none;
-    max-width: 80%;
     text-align: center;
     border: 1px solid #ff6b7a;
+    display: none;
+  }
+  #system-summary {
+    display: none;
+    background-color: #14351f;
+    border: 1px solid #2f8f4f;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 13px;
+    color: #dfffe8;
+  }
+  #system-summary .summary-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #8fd6a4;
+    margin-bottom: 6px;
+    font-weight: bold;
+  }
+  #system-summary .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 6px 16px;
+  }
+  #system-summary .summary-item span.val {
+    font-weight: bold;
+    color: #ffffff;
   }
   .prop-group {
     margin-bottom: 14px;
@@ -287,9 +324,14 @@
     </div>
   </div>
 
-  <div id="canvas-container">
-    <div id="error-banner"></div>
-    <canvas id="grid-canvas" width="3000" height="3000"></canvas>
+  <div class="canvas-column">
+    <div id="top-pane">
+      <div id="error-banner"></div>
+      <div id="system-summary"></div>
+    </div>
+    <div id="canvas-container">
+      <canvas id="grid-canvas" width="3000" height="3000"></canvas>
+    </div>
   </div>
 
   <div class="panel-right" id="properties-panel">
@@ -308,16 +350,18 @@ const GRID_SIZE = 40;
 const CANVAS_WIDTH = 3000;
 const CANVAS_HEIGHT = 3000;
 
-let components = []; // { id, type, name, x, y, rotation, voltage, resistance, rating, state, current, currentFlow, voltageDrop }
-let wires = [];      // { id, name, x1, y1, x2, y2, current }
+let components = []; // { id, type, name, x, y, rotation, voltage, resistance, rating, state, current, currentFlow, voltageDrop, maxEnergyWh, soc }
+// A wire is a polyline of nodes. Each node is either { x, y } (free point)
+// or { compId, terminalIndex } (bound to a component connection point).
+let wires = [];      // { id, name, nodes:[...], current }
 let junctions = [];  // { id, name, x, y }
 
 let selectedItems = new Set();
 let toolMode = 'select';
-let wireDrawing = null;
+let wireDrawing = null;   // { nodes:[...], currentX, currentY }
 let selectionBox = null;
 let isDragging = false;
-let dragTarget = null;
+let dragTarget = null;     // { kind:'component'|'junction'|'wireNode'|'wireMidpoint', ... }
 let dragOffset = null;
 let hoverTerminal = null;
 let nextId = 1;
@@ -327,6 +371,7 @@ const canvasContainer = document.getElementById('canvas-container');
 const canvas = document.getElementById('grid-canvas');
 const ctx = canvas.getContext('2d');
 const errorBanner = document.getElementById('error-banner');
+const systemSummary = document.getElementById('system-summary');
 const propContent = document.getElementById('prop-content');
 const compListContainer = document.getElementById('comp-list-container');
 
@@ -338,23 +383,39 @@ canvasContainer.scrollTop = (CANVAS_HEIGHT - canvasContainer.clientHeight) / 2;
 function initSampleCircuit() {
   let cx = Math.round(CANVAS_WIDTH / 2 / GRID_SIZE) * GRID_SIZE;
   let cy = Math.round(CANVAS_HEIGHT / 2 / GRID_SIZE) * GRID_SIZE;
-  
+
   let b1 = addComponent('battery', cx - 120, cy);
-  b1.voltage = 12; b1.name = "Batt1";
+  b1.voltage = 12; b1.name = "Batt1"; b1.maxEnergyWh = 100; b1.soc = 100;
   let r1 = addComponent('resistor', cx, cy - 120);
   r1.resistance = 60; r1.name = "R1"; r1.rotation = 0;
   let sw1 = addComponent('switch', cx, cy + 120);
   sw1.name = "SW1"; sw1.state = 'ON';
   let f1 = addComponent('fuse', cx + 120, cy);
   f1.name = "F1"; f1.rating = 2; f1.rotation = 90;
-  
-  addWire(b1.x - 40, b1.y, cx - 160, cy);
-  addWire(cx - 160, cy, cx - 160, cy - 120);
-  addWire(cx - 160, cy - 120, r1.x - 40, r1.y - 120);
-  addWire(r1.x + 40, r1.y - 120, f1.x, f1.y - 40);
-  addWire(f1.x, f1.y + 40, sw1.x + 40, sw1.y + 120);
-  addWire(sw1.x - 40, sw1.y + 120, b1.x + 40, b1.y);
-  
+
+  // Terminal-bound nodes keep wires attached when components move.
+  addWireFromNodes([
+    { compId: b1.id, terminalIndex: 0 },
+    { x: cx - 160, y: cy },
+    { x: cx - 160, y: cy - 120 },
+    { compId: r1.id, terminalIndex: 0 }
+  ]);
+  addWireFromNodes([
+    { compId: r1.id, terminalIndex: 1 },
+    { x: cx + 120, y: cy - 120 },
+    { compId: f1.id, terminalIndex: 0 }
+  ]);
+  addWireFromNodes([
+    { compId: f1.id, terminalIndex: 1 },
+    { x: cx + 120, y: cy + 120 },
+    { compId: sw1.id, terminalIndex: 1 }
+  ]);
+  addWireFromNodes([
+    { compId: sw1.id, terminalIndex: 0 },
+    { x: cx - 120, y: cy + 120 },
+    { compId: b1.id, terminalIndex: 1 }
+  ]);
+
   runSimulation();
   render();
 }
@@ -376,6 +437,50 @@ function getTerminals(comp) {
   return [{ x: comp.x - d, y: comp.y }, { x: comp.x + d, y: comp.y }];
 }
 
+// --- WIRE NODE HELPERS ---
+// Resolve a node to a concrete {x, y} position on the grid.
+function nodePos(node) {
+  if (node.compId !== undefined) {
+    let comp = components.find(c => c.id === node.compId);
+    if (comp) {
+      let terms = getTerminals(comp);
+      let t = terms[node.terminalIndex] || terms[0];
+      return { x: t.x, y: t.y };
+    }
+  }
+  return { x: node.x, y: node.y };
+}
+
+function isBoundNode(node) {
+  return node.compId !== undefined && components.some(c => c.id === node.compId);
+}
+
+// Resolve every node of a wire to concrete coordinates.
+function wirePoints(w) {
+  return w.nodes.map(nodePos);
+}
+
+// Find a component terminal near a point; returns { compId, terminalIndex } or null.
+function terminalAt(x, y, tol = 6) {
+  for (let c of components) {
+    let terms = getTerminals(c);
+    for (let i = 0; i < terms.length; i++) {
+      if (Math.hypot(x - terms[i].x, y - terms[i].y) <= tol) {
+        return { compId: c.id, terminalIndex: i };
+      }
+    }
+  }
+  return null;
+}
+
+// Build a node from a raw coordinate, binding to a component terminal if one is there.
+function makeNode(x, y) {
+  x = snap(x); y = snap(y);
+  let t = terminalAt(x, y);
+  if (t) return t;
+  return { x, y };
+}
+
 function addComponent(type, x, y) {
   let namePrefix = { battery: 'Batt', resistor: 'R', switch: 'SW', fuse: 'F', junction: 'J' }[type] || 'C';
   let comp = {
@@ -389,7 +494,7 @@ function addComponent(type, x, y) {
     currentFlow: 0,
     voltageDrop: 0
   };
-  if (type === 'battery') comp.voltage = 10;
+  if (type === 'battery') { comp.voltage = 10; comp.maxEnergyWh = 100; comp.soc = 100; }
   if (type === 'resistor') comp.resistance = 100;
   if (type === 'switch') comp.state = 'ON';
   if (type === 'fuse') { comp.rating = 5; comp.state = 'INTACT'; }
@@ -404,26 +509,26 @@ function addComponent(type, x, y) {
   return comp;
 }
 
-function addWire(x1, y1, x2, y2) {
-  x1 = snap(x1); y1 = snap(y1); x2 = snap(x2); y2 = snap(y2);
-  if (x1 === x2 && y1 === y2) return null;
-  if (Math.hypot(x2 - x1, y2 - y1) < GRID_SIZE * 0.9) return null;
-  
-  for (let w of wires) {
-    if ((w.x1 === x1 && w.y1 === y1 && w.x2 === x2 && w.y2 === y2) ||
-        (w.x1 === x2 && w.y1 === y2 && w.x2 === x1 && w.y2 === y1)) {
-      return w;
-    }
-  }
-  
+// Create a wire from an explicit list of node objects.
+function addWireFromNodes(nodes) {
+  if (!nodes || nodes.length < 2) return null;
   let w = {
     id: 'w_' + (nextId++),
     name: 'Wire ' + nextId,
-    x1, y1, x2, y2,
+    nodes: nodes,
     current: 0
   };
   wires.push(w);
   return w;
+}
+
+// Backwards-compatible helper: create a 2-node wire from raw coordinates.
+function addWire(x1, y1, x2, y2) {
+  let n1 = makeNode(x1, y1);
+  let n2 = makeNode(x2, y2);
+  let p1 = nodePos(n1), p2 = nodePos(n2);
+  if (p1.x === p2.x && p1.y === p2.y) return null;
+  return addWireFromNodes([n1, n2]);
 }
 
 function distToSegment(px, py, x1, y1, x2, y2) {
@@ -434,71 +539,61 @@ function distToSegment(px, py, x1, y1, x2, y2) {
   return Math.hypot(px - (x1 + t * (x2 - x1)), py - (y1 + t * (y2 - y1)));
 }
 
-function pointOnWire(px, py, w) {
-  if ((px === w.x1 && py === w.y1) || (px === w.x2 && py === w.y2)) return false;
-  return distToSegment(px, py, w.x1, w.y1, w.x2, w.y2) < 0.1;
+// Distance from a point to any segment of a polyline wire.
+function distToWire(px, py, w) {
+  let pts = wirePoints(w);
+  let min = Infinity;
+  for (let i = 0; i < pts.length - 1; i++) {
+    let d = distToSegment(px, py, pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y);
+    if (d < min) min = d;
+  }
+  return min;
 }
 
-function splitWiresAtPoint(px, py) {
-  px = snap(px); py = snap(py);
-  for (let i = wires.length - 1; i >= 0; i--) {
-    let w = wires[i];
-    if (pointOnWire(px, py, w)) {
-      wires.splice(i, 1);
-      addWire(w.x1, w.y1, px, py);
-      addWire(px, py, w.x2, w.y2);
-      if (!junctions.some(j => j.x === px && j.y === py)) {
-        junctions.push({ id: 'j_' + (nextId++), name: 'J' + nextId, x: px, y: py });
+// Is (px,py) a terminal (first or last resolved node) of wire w?
+function isWireTerminal(px, py, w) {
+  let pts = wirePoints(w);
+  let a = pts[0], b = pts[pts.length - 1];
+  return (Math.abs(px - a.x) < 1 && Math.abs(py - a.y) < 1) ||
+         (Math.abs(px - b.x) < 1 && Math.abs(py - b.y) < 1);
+}
+
+// Locate where a point falls on a wire: returns
+//   { onWire, isTerminal, segIndex } for the closest wire within tolerance.
+function locateOnWire(px, py, tol = 6, excludeId = null) {
+  for (let w of wires) {
+    if (excludeId && w.id === excludeId) continue;
+    let pts = wirePoints(w);
+    for (let i = 0; i < pts.length - 1; i++) {
+      let d = distToSegment(px, py, pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y);
+      if (d <= tol) {
+        return { wire: w, isTerminal: isWireTerminal(px, py, w), segIndex: i };
       }
-      break;
     }
+  }
+  return null;
+}
+
+function ensureJunctionAt(px, py) {
+  if (!junctions.some(j => j.x === px && j.y === py)) {
+    junctions.push({ id: 'j_' + (nextId++), name: 'J' + nextId, x: px, y: py });
   }
 }
 
-function combineSeriesWires() {
-  let changed = true;
-  while (changed) {
-    changed = false;
-    let ptMap = new Map();
-    let terminals = new Set();
-    
-    for (let c of components) {
-      let terms = getTerminals(c);
-      terminals.add(getKey(terms[0].x, terms[0].y));
-      terminals.add(getKey(terms[1].x, terms[1].y));
-    }
-    
-    for (let i = 0; i < wires.length; i++) {
-      let w = wires[i];
-      let k1 = getKey(w.x1, w.y1);
-      let k2 = getKey(w.x2, w.y2);
-      if (!ptMap.has(k1)) ptMap.set(k1, []);
-      if (!ptMap.has(k2)) ptMap.set(k2, []);
-      ptMap.get(k1).push({ wireIndex: i, end: 1, w });
-      ptMap.get(k2).push({ wireIndex: i, end: 2, w });
-    }
-    
-    for (let [key, conn] of ptMap.entries()) {
-      if (conn.length === 2 && !terminals.has(key)) {
-        let w1 = conn[0].w;
-        let w2 = conn[1].w;
-        if (w1.id === w2.id) continue;
-        
-        let [gx, gy] = key.split(',').map(Number);
-        let jIdx = junctions.findIndex(j => j.x === gx && j.y === gy);
-        if (jIdx !== -1) {
-          junctions.splice(jIdx, 1);
-        }
-        
-        let p1 = (conn[0].end === 1) ? { x: w1.x2, y: w1.y2 } : { x: w1.x1, y: w1.y1 };
-        let p2 = (conn[1].end === 1) ? { x: w2.x2, y: w2.y2 } : { x: w2.x1, y: w2.y1 };
-        
-        let toRemove = [w1.id, w2.id];
-        wires = wires.filter(w => !toRemove.includes(w.id));
-        addWire(p1.x, p1.y, p2.x, p2.y);
-        changed = true;
-        break;
-      }
+// Split a polyline wire at an interior point (creating a shared node/junction),
+// so an incoming branch attaches at a real vertex.
+function splitWireAtInteriorPoint(w, px, py) {
+  let pts = wirePoints(w);
+  // If the point already coincides with an existing (non-terminal) node, nothing to do.
+  for (let i = 1; i < pts.length - 1; i++) {
+    if (pts[i].x === px && pts[i].y === py) { ensureJunctionAt(px, py); return; }
+  }
+  for (let i = 0; i < pts.length - 1; i++) {
+    let d = distToSegment(px, py, pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y);
+    if (d < 0.5) {
+      w.nodes.splice(i + 1, 0, { x: px, y: py });
+      ensureJunctionAt(px, py);
+      return;
     }
   }
 }
@@ -514,6 +609,30 @@ function findItemAt(mx, my) {
     }
   }
   
+  // Draggable free wire nodes (not bound to a component terminal).
+  for (let w of wires) {
+    for (let i = 0; i < w.nodes.length; i++) {
+      if (isBoundNode(w.nodes[i])) continue;
+      let p = nodePos(w.nodes[i]);
+      if (Math.hypot(mx - p.x, my - p.y) <= 9) {
+        return { type: 'wireNode', item: w, nodeIndex: i };
+      }
+    }
+  }
+
+  // Draggable segment midpoints (both endpoints are free nodes).
+  for (let w of wires) {
+    let pts = wirePoints(w);
+    for (let i = 0; i < w.nodes.length - 1; i++) {
+      if (isBoundNode(w.nodes[i]) || isBoundNode(w.nodes[i + 1])) continue;
+      let mxp = (pts[i].x + pts[i + 1].x) / 2;
+      let myp = (pts[i].y + pts[i + 1].y) / 2;
+      if (Math.hypot(mx - mxp, my - myp) <= 8) {
+        return { type: 'wireMidpoint', item: w, segIndex: i };
+      }
+    }
+  }
+
   for (let j of junctions) {
     if (Math.hypot(mx - j.x, my - j.y) <= 12) return { type: 'junction', item: j };
   }
@@ -523,7 +642,7 @@ function findItemAt(mx, my) {
   }
   
   for (let w of wires) {
-    if (distToSegment(mx, my, w.x1, w.y1, w.x2, w.y2) <= 8) return { type: 'wire', item: w };
+    if (distToWire(mx, my, w) <= 8) return { type: 'wire', item: w };
   }
   return null;
 }
@@ -557,7 +676,10 @@ function runSimulation() {
   };
   
   for (let w of wires) {
-    union(getKey(w.x1, w.y1), getKey(w.x2, w.y2));
+    let pts = wirePoints(w);
+    for (let i = 0; i < pts.length - 1; i++) {
+      union(getKey(pts[i].x, pts[i].y), getKey(pts[i + 1].x, pts[i + 1].y));
+    }
   }
   
   let compNodes = new Map();
@@ -708,7 +830,8 @@ function runSimulation() {
   }
   
   for (let w of wires) {
-    let k1 = find(getKey(w.x1, w.y1));
+    let pts = wirePoints(w);
+    let k1 = find(getKey(pts[0].x, pts[0].y));
     let attached = components.find(c => {
       let terms = getTerminals(c);
       return find(getKey(terms[0].x, terms[0].y)) === k1 || find(getKey(terms[1].x, terms[1].y)) === k1;
@@ -716,6 +839,28 @@ function runSimulation() {
     if (attached) w.current = attached.current || 0;
   }
   
+  // Save topology so the formula generator can trace the actual circuit layout.
+  simTopology = {
+    compNodes,        // Map: compId -> { n1, n2 } (union-find net roots)
+    nodeDegree,       // Map: net root -> degree (active edges touching it)
+    nodeVoltages,     // net root voltages, keyed via nodeMap
+    nodeMap           // Map: net root -> index into nodeVoltages
+  };
+
+  // --- POWER (Feature 1) ---
+  // Voltage change sign: sources (battery) deliver power (positive change),
+  // loads (resistors, etc.) drop voltage (negative change).
+  for (let c of components) {
+    let signedV;
+    if (c.type === 'battery') {
+      signedV = c.voltageDrop;          // battery raises potential -> positive
+    } else {
+      signedV = -(c.voltageDrop || 0);  // load drops potential -> negative
+    }
+    c.signedVoltage = signedV;
+    c.power = signedV * (c.current || 0);
+  }
+
   for (let c of components) {
     if (c.type === 'fuse' && c.state === 'INTACT') {
       if (c.current > c.rating) {
@@ -727,81 +872,142 @@ function runSimulation() {
   updateUI();
 }
 
+let simTopology = null;
+
+// Trace the series loop a component belongs to. Returns the ordered list of
+// active components in the loop if it is a simple series loop (every net on
+// the path has degree exactly 2), otherwise null.
+function traceSeriesLoop(startComp) {
+  if (!simTopology) return null;
+  let { compNodes, nodeDegree } = simTopology;
+  let active = components.filter(c =>
+    !((c.type === 'switch' && c.state === 'OFF') || (c.type === 'fuse' && c.state === 'BLOWN'))
+  );
+  // Build net -> components incidence (only for components with distinct nets).
+  let netComps = new Map();
+  for (let c of active) {
+    let nn = compNodes.get(c.id);
+    if (!nn || nn.n1 === nn.n2) return null;
+    for (let net of [nn.n1, nn.n2]) {
+      if (!netComps.has(net)) netComps.set(net, []);
+      netComps.get(net).push(c);
+    }
+  }
+  // Every net in a pure series loop connects exactly two components.
+  for (let [net, list] of netComps.entries()) {
+    if (list.length !== 2) return null;
+  }
+  // Walk the loop.
+  let loop = [];
+  let visited = new Set();
+  let current = startComp;
+  let prevNet = null;
+  while (current && !visited.has(current.id)) {
+    visited.add(current.id);
+    loop.push(current);
+    let nn = compNodes.get(current.id);
+    let nextNet = (nn.n1 === prevNet) ? nn.n2 : nn.n1;
+    let candidates = (netComps.get(nextNet) || []).filter(c => c.id !== current.id);
+    prevNet = nextNet;
+    current = candidates[0];
+  }
+  if (loop.length !== active.length) return null;
+  return loop;
+}
+
 // --- FORMULA GENERATOR ---
+// Build the correct current equation from the actual circuit topology.
+// For a simple series loop:  I = (ΣV_sources) / (ΣR)  using Kirchhoff's Loop Rule.
+function getLoopCurrentFormula(comp) {
+  let loop = traceSeriesLoop(comp);
+  if (!loop) return null;
+
+  let sources = loop.filter(c => c.type === 'battery');
+  let resistors = loop.filter(c => c.type === 'resistor');
+  if (sources.length === 0 || resistors.length === 0) return null;
+
+  let vNames = sources.map(s => `${s.name}.voltage`).join(" + ");
+  let vVals = sources.map(s => `${s.voltage}V`).join(" + ");
+  let sumV = sources.reduce((s, c) => s + c.voltage, 0);
+
+  let rNames = resistors.map(r => `${r.name}.resistance`).join(" + ");
+  let rVals = resistors.map(r => `${r.resistance}Ω`).join(" + ");
+  let sumR = resistors.reduce((s, c) => s + c.resistance, 0);
+
+  let vLead = sources.length > 1 ? `(${vNames})` : vNames;
+  let vNumLead = sources.length > 1 ? `(${vVals})` : vVals;
+  let rLead = resistors.length > 1 ? `(${rNames})` : rNames;
+  let rNumLead = resistors.length > 1 ? `(${rVals})` : rVals;
+
+  let I = sumR !== 0 ? sumV / sumR : 0;
+  return {
+    varStr: `${vLead} / ${rLead}`,
+    numStr: `${vNumLead} / ${rNumLead} = ${I.toFixed(3)}A`,
+    value: I
+  };
+}
+
 function getFormulas(comp) {
   let I = comp.current || 0;
   let V = comp.voltageDrop || 0;
-  
+  let loopF = getLoopCurrentFormula(comp);
+
   if (comp.type === 'resistor') {
-    let battery = components.find(c => c.type === 'battery');
-    if (battery && Math.abs(V - battery.voltage) < 0.01) {
-      return {
-        current: {
-          var: `${battery.name}.voltage / ${comp.name}.resistance`,
-          num: `${battery.voltage}V / ${comp.resistance}Ω = ${I.toFixed(3)}A`
-        },
-        voltage: {
-          var: `${battery.name}.voltage`,
-          num: `${battery.voltage}V = ${V.toFixed(3)}V`
-        }
-      };
-    }
-    let totalRes = components.filter(c => c.type === 'resistor').reduce((sum, r) => sum + r.resistance, 0);
-    if (battery && Math.abs(I - battery.voltage / totalRes) < 0.01) {
-      let resNames = components.filter(c => c.type === 'resistor').map(r => r.name + ".resistance").join(" + ");
-      let resVals = components.filter(c => c.type === 'resistor').map(r => r.resistance + "Ω").join(" + ");
-      return {
-        current: {
-          var: `${battery.name}.voltage / (${resNames})`,
-          num: `${battery.voltage}V / (${resVals}) = ${I.toFixed(3)}A`
-        },
-        voltage: {
-          var: `Current * ${comp.name}.resistance`,
-          num: `${I.toFixed(3)}A * ${comp.resistance}Ω = ${V.toFixed(3)}V`
-        }
-      };
-    }
+    let current = loopF
+      ? { var: `Loop Rule: ${loopF.varStr}`, num: `${loopF.numStr}` }
+      : { var: `${comp.name}.voltageDrop / ${comp.name}.resistance`,
+          num: `${V.toFixed(3)}V / ${comp.resistance}Ω = ${I.toFixed(3)}A` };
+    // Voltage drop across a resistor: V = I × R (I = calculated loop current).
     return {
-      current: {
-        var: `Voltage Drop / ${comp.name}.resistance`,
-        num: `${V.toFixed(3)}V / ${comp.resistance}Ω = ${I.toFixed(3)}A`
-      },
+      current,
       voltage: {
-        var: `Current * ${comp.name}.resistance`,
-        num: `${I.toFixed(3)}A * ${comp.resistance}Ω = ${V.toFixed(3)}V`
+        var: `I × ${comp.name}.resistance`,
+        num: `${I.toFixed(3)}A × ${comp.resistance}Ω = ${V.toFixed(3)}V`
       }
     };
   } else if (comp.type === 'battery') {
-    let totalRes = components.filter(c => c.type === 'resistor').reduce((sum, r) => sum + r.resistance, 0);
-    let resNames = components.filter(c => c.type === 'resistor').map(r => r.name + ".resistance").join(" + ");
-    let resVals = components.filter(c => c.type === 'resistor').map(r => r.resistance + "Ω").join(" + ");
+    let current = loopF
+      ? { var: `Loop Rule: ${loopF.varStr}`, num: `${loopF.numStr}` }
+      : { var: `Branch Current (from nodal solution)`, num: `${I.toFixed(3)}A` };
     return {
-      current: {
-        var: `${comp.name}.voltage / (${resNames || 'R_total'})`,
-        num: `${comp.voltage}V / (${resVals || '1Ω'}) = ${I.toFixed(3)}A`
-      },
+      current,
       voltage: {
-        var: `${comp.name}.voltage`,
+        var: `${comp.name}.voltage (source EMF)`,
         num: `${comp.voltage}V`
       }
     };
   } else {
+    // Switch / fuse (ideal, zero drop when conducting).
+    let current = loopF
+      ? { var: `Loop Rule: ${loopF.varStr}`, num: `${loopF.numStr}` }
+      : { var: `Branch Current (from nodal solution)`, num: `${I.toFixed(3)}A` };
     return {
-      current: { var: `Branch Current`, num: `${I.toFixed(3)}A` },
-      voltage: { var: `0V (Short/Switch/Fuse)`, num: `0V` }
+      current,
+      voltage: {
+        var: `I × 0Ω (ideal conductor)`,
+        num: `${I.toFixed(3)}A × 0Ω = 0.000V`
+      }
     };
   }
+}
+
+// Return the two resolved endpoints (terminals) of a polyline wire.
+function wireEnds(w) {
+  let pts = wirePoints(w);
+  return [pts[0], pts[pts.length - 1]];
 }
 
 // --- KCL BRANCH CURRENTS CALCULATION ---
 function getJunctionBranchCurrents(junc) {
   let branches = [];
-  let connectedWires = wires.filter(w => 
-    (w.x1 === junc.x && w.y1 === junc.y) || (w.x2 === junc.x && w.y2 === junc.y)
-  );
+  let connectedWires = wires.filter(w => {
+    let [a, b] = wireEnds(w);
+    return (a.x === junc.x && a.y === junc.y) || (b.x === junc.x && b.y === junc.y);
+  });
   
   for (let w of connectedWires) {
-    let startP = (w.x1 === junc.x && w.y1 === junc.y) ? {x: w.x2, y: w.y2} : {x: w.x1, y: w.y1};
+    let [a, b] = wireEnds(w);
+    let startP = (a.x === junc.x && a.y === junc.y) ? b : a;
     let visitedPts = new Set();
     let queue = [ `${startP.x},${startP.y}` ];
     visitedPts.add(`${junc.x},${junc.y}`);
@@ -813,9 +1019,10 @@ function getJunctionBranchCurrents(junc) {
       
       for (let ow of wires) {
         if (ow.id === w.id) continue;
+        let [oa, ob] = wireEnds(ow);
         let nextP = null;
-        if (ow.x1 === cx && ow.y1 === cy) nextP = `${ow.x2},${ow.y2}`;
-        else if (ow.x2 === cx && ow.y2 === cy) nextP = `${ow.x1},${ow.y1}`;
+        if (oa.x === cx && oa.y === cy) nextP = `${ob.x},${ob.y}`;
+        else if (ob.x === cx && ob.y === cy) nextP = `${oa.x},${oa.y}`;
         
         if (nextP && !visitedPts.has(nextP)) {
           visitedPts.add(nextP);
@@ -865,15 +1072,41 @@ function render() {
   }
   ctx.stroke();
   
-  // Wires
+  // Wires (polylines)
   wires.forEach(w => {
+    let pts = wirePoints(w);
     let isSelected = selectedItems.has(w.id);
     ctx.strokeStyle = isSelected ? '#4cacff' : '#ff3333';
     ctx.lineWidth = isSelected ? 4 : 3;
     ctx.beginPath();
-    ctx.moveTo(w.x1, w.y1);
-    ctx.lineTo(w.x2, w.y2);
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
     ctx.stroke();
+
+    if (isSelected) {
+      // Draggable free-node handles.
+      for (let i = 0; i < w.nodes.length; i++) {
+        if (isBoundNode(w.nodes[i])) continue;
+        let p = pts[i];
+        ctx.fillStyle = '#4cacff';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      // Draggable segment midpoints (both endpoints free).
+      for (let i = 0; i < w.nodes.length - 1; i++) {
+        if (isBoundNode(w.nodes[i]) || isBoundNode(w.nodes[i + 1])) continue;
+        let mxp = (pts[i].x + pts[i + 1].x) / 2;
+        let myp = (pts[i].y + pts[i + 1].y) / 2;
+        ctx.strokeStyle = '#4cacff';
+        ctx.fillStyle = '#1e1e1e';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(mxp, myp, 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
   });
   
   if (wireDrawing) {
@@ -881,10 +1114,19 @@ function render() {
     ctx.lineWidth = 3;
     ctx.setLineDash([6, 6]);
     ctx.beginPath();
-    ctx.moveTo(wireDrawing.x1, wireDrawing.y1);
+    let dp = wireDrawing.nodes.map(nodePos);
+    ctx.moveTo(dp[0].x, dp[0].y);
+    for (let i = 1; i < dp.length; i++) ctx.lineTo(dp[i].x, dp[i].y);
     ctx.lineTo(snap(wireDrawing.currentX), snap(wireDrawing.currentY));
     ctx.stroke();
     ctx.setLineDash([]);
+    // Show committed points.
+    ctx.fillStyle = '#ffcc88';
+    for (let p of dp) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
   
   // Junctions
@@ -1029,6 +1271,61 @@ function drawToggleButton(comp) {
   ctx.restore();
 }
 
+// Power a voltage supply is delivering to the circuit (W).
+function batterySuppliedPower(b) {
+  return (b.voltage || 0) * (b.current || 0);
+}
+
+// Minutes (whole number) until a supply drains from current SOC to targetSOC%,
+// draining at the present rate. Returns null if not draining / already below.
+function minutesUntilSOC(b, targetSOC) {
+  let maxWh = b.maxEnergyWh || 0;
+  let soc = (b.soc === undefined ? 100 : b.soc);
+  let powerW = batterySuppliedPower(b);
+  if (maxWh <= 0 || powerW <= 1e-9) return null;
+  let deltaSOC = soc - targetSOC;
+  if (deltaSOC <= 0) return 0;
+  let energyWh = maxWh * (deltaSOC / 100);   // energy above the target threshold
+  let hours = energyWh / powerW;
+  return Math.floor(hours * 60);
+}
+
+function updateSystemSummary() {
+  if (!systemSummary) return;
+  if (errorMessages.length > 0) {
+    systemSummary.style.display = 'none';
+    return;
+  }
+
+  let supplies = components.filter(c => c.type === 'battery');
+  if (supplies.length === 0) {
+    systemSummary.style.display = 'none';
+    return;
+  }
+
+  let totalSupplied = supplies.reduce((s, b) => s + batterySuppliedPower(b), 0);
+  let maxVoltage = 0;
+  components.forEach(c => {
+    let v = (c.type === 'battery') ? (c.voltage || 0) : (c.voltageDrop || 0);
+    if (v > maxVoltage) maxVoltage = v;
+  });
+  let maxCurrent = components.reduce((m, c) => Math.max(m, c.current || 0), 0);
+
+  // Minutes until the first supply reaches 0% SOC.
+  let runtimes = supplies.map(b => minutesUntilSOC(b, 0)).filter(v => v !== null);
+  let systemMinutes = runtimes.length > 0 ? Math.min(...runtimes) : null;
+
+  systemSummary.style.display = 'block';
+  systemSummary.innerHTML = `
+    <div class="summary-title">System Summary</div>
+    <div class="summary-grid">
+      <div class="summary-item">Total Supplied Power: <span class="val">${totalSupplied.toFixed(3)} W</span></div>
+      <div class="summary-item">Maximum Voltage: <span class="val">${maxVoltage.toFixed(3)} V</span></div>
+      <div class="summary-item">Maximum Current: <span class="val">${maxCurrent.toFixed(3)} A</span></div>
+      <div class="summary-item">Runtime to 0% SOC: <span class="val">${systemMinutes === null ? 'N/A' : systemMinutes + ' min'}</span></div>
+    </div>`;
+}
+
 function updateUI() {
   if (errorMessages.length > 0) {
     errorBanner.style.display = 'block';
@@ -1036,6 +1333,7 @@ function updateUI() {
   } else {
     errorBanner.style.display = 'none';
   }
+  updateSystemSummary();
   
   compListContainer.innerHTML = '';
   let allItems = [
@@ -1097,6 +1395,14 @@ function updatePropertiesPanel() {
         <div class="prop-group">
           <label class="prop-label">Voltage (V)</label>
           <input type="number" class="prop-input" value="${comp.voltage}" step="0.5" onchange="updateProp('${comp.id}', 'voltage', parseFloat(this.value))">
+        </div>
+        <div class="prop-group">
+          <label class="prop-label">Max Available Energy (Wh)</label>
+          <input type="number" class="prop-input" value="${comp.maxEnergyWh === undefined ? 100 : comp.maxEnergyWh}" step="10" min="0" onchange="updateProp('${comp.id}', 'maxEnergyWh', Math.max(0, parseFloat(this.value)))">
+        </div>
+        <div class="prop-group">
+          <label class="prop-label">State of Charge (%)</label>
+          <input type="number" class="prop-input" value="${comp.soc === undefined ? 100 : comp.soc}" step="1" min="0" max="100" onchange="updateProp('${comp.id}', 'soc', Math.max(0, Math.min(100, parseFloat(this.value))))">
         </div>`;
     } else if (comp.type === 'resistor') {
       html += `
@@ -1156,6 +1462,67 @@ function updatePropertiesPanel() {
           <div class="formula-num">= ${f.voltage.num}</div>
         </div>
       </div>`;
+
+    // --- POWER (Feature 1) ---
+    let power = comp.power || 0;
+    let powerColor = power < 0 ? '#ff6b7a' : '#4ee44e';
+    html += `
+      <div class="prop-group">
+        <label class="prop-label">Power</label>
+        <div style="font-size: 15px; font-weight: bold; color: ${powerColor};">${power.toFixed(3)} W</div>
+        <div class="formula-box">
+          <div>Formula: ${comp.type === 'battery' ? 'Voltage' : 'ΔVoltage'} × I</div>
+          <div class="formula-num">= ${(comp.signedVoltage || 0).toFixed(3)}V × ${(comp.current || 0).toFixed(3)}A = ${power.toFixed(3)}W</div>
+        </div>
+      </div>`;
+
+    // --- OUTPUT POWER AS % OF SUPPLIED (Feature 2) ---
+    if ((comp.signedVoltage || 0) < 0) {
+      let totalSupplied = components.filter(c => c.type === 'battery')
+        .reduce((s, b) => s + (b.voltage || 0) * (b.current || 0), 0);
+      let outputPower = Math.abs(power);
+      let pct = totalSupplied > 1e-9 ? (outputPower / totalSupplied) * 100 : 0;
+      html += `
+        <div class="prop-group">
+          <label class="prop-label">Output Power (% of Supplied)</label>
+          <div style="font-size: 15px; font-weight: bold; color: #a3d9ff;">${pct.toFixed(2)} %</div>
+          <div class="formula-box">
+            <div>Formula: |Output Power| / Total Supplied Power × 100</div>
+            <div class="formula-num">= ${outputPower.toFixed(3)}W / ${totalSupplied.toFixed(3)}W × 100 = ${pct.toFixed(2)}%</div>
+          </div>
+        </div>`;
+    }
+
+    // --- VOLTAGE SUPPLY ENERGY / RUNTIME (Feature 3) ---
+    if (comp.type === 'battery') {
+      let maxWh = comp.maxEnergyWh === undefined ? 100 : comp.maxEnergyWh;
+      let soc = comp.soc === undefined ? 100 : comp.soc;
+      let availableWh = maxWh * (soc / 100);
+      let m35 = minutesUntilSOC(comp, 35);
+      let m15 = minutesUntilSOC(comp, 15);
+      let m0 = minutesUntilSOC(comp, 0);
+      let fmt = (m) => (m === null ? 'N/A (not draining)' : m + ' min');
+      html += `
+        <div style="border-top: 1px solid #2a2a2a; margin: 16px 0;"></div>
+        <div class="panel-title">Voltage Supply Energy</div>
+        <div class="prop-group">
+          <label class="prop-label">Available Energy</label>
+          <div style="font-size: 15px; font-weight: bold; color: #fff;">${availableWh.toFixed(3)} Wh</div>
+          <div class="formula-box">
+            <div>Formula: Max Available Energy × SOC</div>
+            <div class="formula-num">= ${maxWh}Wh × ${soc}% = ${availableWh.toFixed(3)}Wh</div>
+          </div>
+        </div>
+        <div class="prop-group">
+          <label class="prop-label">Time to Drain at Current Rate</label>
+          <div class="branch-list">
+            <div class="branch-item"><span>SOC → 35%</span><span>${fmt(m35)}</span></div>
+            <div class="branch-item"><span>SOC → 15%</span><span>${fmt(m15)}</span></div>
+            <div class="branch-item"><span>SOC → 0%</span><span>${fmt(m0)}</span></div>
+          </div>
+        </div>`;
+    }
+
     propContent.innerHTML = html;
   } 
   else if (junc) {
@@ -1204,8 +1571,8 @@ function updatePropertiesPanel() {
         <input type="text" class="prop-input" value="${wire.name}" onchange="updateProp('${wire.id}', 'name', this.value)">
       </div>
       <div class="prop-group">
-        <label class="prop-label">Endpoints</label>
-        <div style="font-size: 13px; color: #aaa;">(${wire.x1}, ${wire.y1}) to (${wire.x2}, ${wire.y2})</div>
+        <label class="prop-label">Nodes (${wire.nodes.length})</label>
+        <div style="font-size: 13px; color: #aaa;">${wirePoints(wire).map(p => `(${p.x}, ${p.y})`).join(' → ')}</div>
       </div>
       <div class="prop-group">
         <button class="btn danger" style="width: 100%;" onclick="deleteSelected()">🗑️ Delete Wire</button>
@@ -1232,36 +1599,31 @@ function updateProp(id, prop, val) {
 }
 
 function rotateSelected() {
+  // Wires bound to component terminals re-resolve automatically after rotation.
   selectedItems.forEach(id => {
     let comp = components.find(c => c.id === id);
-    if (comp) {
-      let oldTerms = getTerminals(comp);
-      comp.rotation = ((comp.rotation || 0) + 90) % 360;
-      let newTerms = getTerminals(comp);
-      
-      oldTerms.forEach((ot, idx) => {
-        let nt = newTerms[idx];
-        wires.forEach(w => {
-          if (w.x1 === ot.x && w.y1 === ot.y) { w.x1 = nt.x; w.y1 = nt.y; }
-          if (w.x2 === ot.x && w.y2 === ot.y) { w.x2 = nt.x; w.y2 = nt.y; }
-        });
-        junctions.forEach(j => {
-          if (j.id !== comp.id && j.x === ot.x && j.y === ot.y) { j.x = nt.x; j.y = nt.y; }
-        });
-      });
-    }
+    if (comp) comp.rotation = ((comp.rotation || 0) + 90) % 360;
   });
-  combineSeriesWires();
   runSimulation();
 }
 
 function deleteSelected() {
   if (selectedItems.size === 0) return;
+  let deletedCompIds = new Set(components.filter(c => selectedItems.has(c.id)).map(c => c.id));
+  // Detach any wire nodes bound to soon-to-be-deleted components (freeze them in place).
+  wires.forEach(w => {
+    w.nodes = w.nodes.map(n => {
+      if (n.compId !== undefined && deletedCompIds.has(n.compId)) {
+        let p = nodePos(n);
+        return { x: p.x, y: p.y };
+      }
+      return n;
+    });
+  });
   components = components.filter(c => !selectedItems.has(c.id));
   junctions = junctions.filter(j => !selectedItems.has(j.id));
   wires = wires.filter(w => !selectedItems.has(w.id));
   selectedItems.clear();
-  combineSeriesWires();
   runSimulation();
 }
 
@@ -1286,6 +1648,105 @@ function setToolMode(mode) {
   canvas.style.cursor = mode === 'wire' ? 'crosshair' : 'default';
   if (mode !== 'wire') wireDrawing = null;
   render();
+}
+
+// Determine the correct node for a click position, binding to a component
+// terminal or a wire terminal if the click lands on one.
+function resolveDrawNode(mx, my) {
+  if (hoverTerminal) {
+    return { compId: hoverTerminal.compId, terminalIndex: hoverTerminal.terminalIndex, _pt: { x: hoverTerminal.x, y: hoverTerminal.y } };
+  }
+  let sx = snap(mx), sy = snap(my);
+  return { x: sx, y: sy, _pt: { x: sx, y: sy } };
+}
+
+// Single-click: prime a new point for the wire currently being drawn.
+function addWirePoint(mx, my) {
+  let node = resolveDrawNode(mx, my);
+  let pt = node._pt;
+  delete node._pt;
+
+  if (!wireDrawing) {
+    wireDrawing = { nodes: [node], currentX: mx, currentY: my, startPt: pt };
+    render();
+    return;
+  }
+  wireDrawing.nodes.push(node);
+  wireDrawing.currentX = mx;
+  wireDrawing.currentY = my;
+  render();
+}
+
+// Double-click: add a final node and finalize the current wire.
+function finishWireDrawing(mx, my) {
+  if (!wireDrawing) return;
+  let node = resolveDrawNode(mx, my);
+  delete node._pt;
+  wireDrawing.nodes.push(node);
+
+  let nodes = wireDrawing.nodes;
+  wireDrawing = null;
+
+  // Drop consecutive duplicate points.
+  let cleaned = [];
+  for (let n of nodes) {
+    let p = nodePos(n);
+    if (cleaned.length > 0) {
+      let pp = nodePos(cleaned[cleaned.length - 1]);
+      if (pp.x === p.x && pp.y === p.y) continue;
+    }
+    cleaned.push(n);
+  }
+  if (cleaned.length < 2) { runSimulation(); return; }
+
+  commitDrawnWire(cleaned);
+  if (toolMode !== 'wire') setToolMode('select');
+  runSimulation();
+}
+
+// Apply extension / branch / junction rules to a freshly drawn polyline.
+function commitDrawnWire(nodes) {
+  let startPt = nodePos(nodes[0]);
+  let endPt = nodePos(nodes[nodes.length - 1]);
+
+  // Check the start endpoint against existing wires.
+  let startHit = locateOnWire(startPt.x, startPt.y, 6);
+  let endHit = locateOnWire(endPt.x, endPt.y, 6);
+
+  // Extension rule: if an endpoint lands on the terminal of an existing wire,
+  // treat the new wire as a continuation of that existing wire.
+  if (startHit && startHit.isTerminal && extendExistingWire(startHit.wire, startPt, nodes, true)) {
+    return;
+  }
+  if (endHit && endHit.isTerminal && extendExistingWire(endHit.wire, endPt, nodes, false)) {
+    return;
+  }
+
+  // Branch rule: if an endpoint lands on a non-terminal part of an existing
+  // wire, create a junction there (splitting the target wire's polyline).
+  if (startHit && !startHit.isTerminal) {
+    splitWireAtInteriorPoint(startHit.wire, startPt.x, startPt.y);
+  }
+  if (endHit && !endHit.isTerminal) {
+    splitWireAtInteriorPoint(endHit.wire, endPt.x, endPt.y);
+  }
+
+  addWireFromNodes(nodes);
+}
+
+// Merge freshly drawn nodes into an existing wire at the given terminal.
+function extendExistingWire(w, joinPt, nodes, joinAtStart) {
+  let pts = wirePoints(w);
+  let atFirst = (Math.abs(pts[0].x - joinPt.x) < 1 && Math.abs(pts[0].y - joinPt.y) < 1);
+  // Order new nodes so the shared point is dropped and the rest continue the wire.
+  let extra = joinAtStart ? nodes.slice(1) : nodes.slice(0, -1);
+  if (!joinAtStart) extra = extra.slice().reverse();
+  if (atFirst) {
+    w.nodes = extra.reverse().concat(w.nodes);
+  } else {
+    w.nodes = w.nodes.concat(extra);
+  }
+  return true;
 }
 
 document.getElementById('btn-tool-select').onclick = () => setToolMode('select');
@@ -1350,26 +1811,46 @@ canvas.addEventListener('mousemove', (e) => {
   if (isDragging && dragTarget) {
     let newX = snap(mx - dragOffset.x);
     let newY = snap(my - dragOffset.y);
-    let dx = newX - dragTarget.x;
-    let dy = newY - dragTarget.y;
-    
-    if (dx !== 0 || dy !== 0) {
-      let oldTerms = dragTarget.type === 'junction' ? [{ x: dragTarget.x, y: dragTarget.y }] : getTerminals(dragTarget);
-      dragTarget.x = newX;
-      dragTarget.y = newY;
-      let newTerms = dragTarget.type === 'junction' ? [{ x: dragTarget.x, y: dragTarget.y }] : getTerminals(dragTarget);
-      
-      oldTerms.forEach((ot, idx) => {
-        let nt = newTerms[idx];
-        wires.forEach(w => {
-          if (w.x1 === ot.x && w.y1 === ot.y) { w.x1 = nt.x; w.y1 = nt.y; }
-          if (w.x2 === ot.x && w.y2 === ot.y) { w.x2 = nt.x; w.y2 = nt.y; }
-        });
-        junctions.forEach(j => {
-          if (j.id !== dragTarget.id && j.x === ot.x && j.y === ot.y) { j.x = nt.x; j.y = nt.y; }
-        });
-      });
+
+    if (dragTarget.kind === 'component') {
+      // Wires bound to this component's terminals auto-follow via nodePos().
+      dragTarget.item.x = newX;
+      dragTarget.item.y = newY;
       runSimulation();
+    } else if (dragTarget.kind === 'junction') {
+      let j = dragTarget.item;
+      let ox = j.x, oy = j.y;
+      if (newX !== ox || newY !== oy) {
+        // Move any free wire nodes that sit on this junction.
+        wires.forEach(w => {
+          w.nodes.forEach(n => {
+            if (!isBoundNode(n) && n.x === ox && n.y === oy) { n.x = newX; n.y = newY; }
+          });
+        });
+        j.x = newX; j.y = newY;
+        runSimulation();
+      }
+    } else if (dragTarget.kind === 'wireNode') {
+      let n = dragTarget.item.nodes[dragTarget.nodeIndex];
+      if (!isBoundNode(n)) {
+        let ox = n.x, oy = n.y;
+        n.x = newX; n.y = newY;
+        junctions.forEach(j => { if (j.x === ox && j.y === oy) { j.x = newX; j.y = newY; } });
+        runSimulation();
+      }
+    } else if (dragTarget.kind === 'wireMidpoint') {
+      let dx = newX - dragOffset.lastX;
+      let dy = newY - dragOffset.lastY;
+      if (dx !== 0 || dy !== 0) {
+        let w = dragTarget.item;
+        let i = dragTarget.segIndex;
+        [w.nodes[i], w.nodes[i + 1]].forEach(n => {
+          if (!isBoundNode(n)) { n.x = snap(n.x + dx); n.y = snap(n.y + dy); }
+        });
+        dragOffset.lastX = newX;
+        dragOffset.lastY = newY;
+        runSimulation();
+      }
     }
     return;
   }
@@ -1389,28 +1870,11 @@ canvas.addEventListener('mousedown', (e) => {
   let mx = e.clientX - rect.left;
   let my = e.clientY - rect.top;
   
-  if (toolMode === 'wire' || (toolMode === 'select' && hoverTerminal && !isDragging)) {
-    let startX = hoverTerminal ? hoverTerminal.x : snap(mx);
-    let startY = hoverTerminal ? hoverTerminal.y : snap(my);
-    
-    if (!wireDrawing) {
-      wireDrawing = { x1: startX, y1: startY, currentX: mx, currentY: my };
-      render();
-      return;
-    } else {
-      let endX = hoverTerminal ? hoverTerminal.x : snap(mx);
-      let endY = hoverTerminal ? hoverTerminal.y : snap(my);
-      
-      splitWiresAtPoint(wireDrawing.x1, wireDrawing.y1);
-      splitWiresAtPoint(endX, endY);
-      
-      let newWire = addWire(wireDrawing.x1, wireDrawing.y1, endX, endY);
-      wireDrawing = null;
-      if (toolMode !== 'wire') setToolMode('select');
-      combineSeriesWires();
-      runSimulation();
-      return;
-    }
+  // Wire drawing: single click primes/adds a point; handled via addWirePoint().
+  // (Double-click to terminate is handled in the dblclick listener.)
+  if (toolMode === 'wire' || wireDrawing || (toolMode === 'select' && hoverTerminal && !isDragging)) {
+    addWirePoint(mx, my);
+    return;
   }
   
   let found = findItemAt(mx, my);
@@ -1430,10 +1894,23 @@ canvas.addEventListener('mousedown', (e) => {
     updatePropertiesPanel();
     render();
     
-    if (found.type === 'component' || found.type === 'junction') {
+    if (found.type === 'component') {
       isDragging = true;
-      dragTarget = found.item;
+      dragTarget = { kind: 'component', item: found.item };
       dragOffset = { x: mx - found.item.x, y: my - found.item.y };
+    } else if (found.type === 'junction') {
+      isDragging = true;
+      dragTarget = { kind: 'junction', item: found.item };
+      dragOffset = { x: mx - found.item.x, y: my - found.item.y };
+    } else if (found.type === 'wireNode') {
+      let p = nodePos(found.item.nodes[found.nodeIndex]);
+      isDragging = true;
+      dragTarget = { kind: 'wireNode', item: found.item, nodeIndex: found.nodeIndex };
+      dragOffset = { x: mx - p.x, y: my - p.y };
+    } else if (found.type === 'wireMidpoint') {
+      isDragging = true;
+      dragTarget = { kind: 'wireMidpoint', item: found.item, segIndex: found.segIndex };
+      dragOffset = { x: 0, y: 0, lastX: snap(mx), lastY: snap(my) };
     }
     return;
   }
@@ -1450,7 +1927,6 @@ canvas.addEventListener('mouseup', () => {
   if (isDragging) {
     isDragging = false;
     dragTarget = null;
-    combineSeriesWires();
     runSimulation();
   }
   
@@ -1468,8 +1944,8 @@ canvas.addEventListener('mouseup', () => {
         if (j.x >= rx1 && j.x <= rx2 && j.y >= ry1 && j.y <= ry2) selectedItems.add(j.id);
       });
       wires.forEach(w => {
-        if (w.x1 >= rx1 && w.x1 <= rx2 && w.y1 >= ry1 && w.y1 <= ry2 &&
-            w.x2 >= rx1 && w.x2 <= rx2 && w.y2 >= ry1 && w.y2 <= ry2) {
+        let pts = wirePoints(w);
+        if (pts.every(p => p.x >= rx1 && p.x <= rx2 && p.y >= ry1 && p.y <= ry2)) {
           selectedItems.add(w.id);
         }
       });
@@ -1478,6 +1954,19 @@ canvas.addEventListener('mouseup', () => {
     selectionBox = null;
     render();
   }
+});
+
+canvas.addEventListener('dblclick', (e) => {
+  if (toolMode !== 'wire' && !wireDrawing) return;
+  let rect = canvas.getBoundingClientRect();
+  let mx = e.clientX - rect.left;
+  let my = e.clientY - rect.top;
+  // The dblclick fires after two mousedowns which each primed a point;
+  // remove the duplicate point that the second click added.
+  if (wireDrawing && wireDrawing.nodes.length > 1) {
+    wireDrawing.nodes.pop();
+  }
+  finishWireDrawing(mx, my);
 });
 
 initSampleCircuit();
